@@ -2,6 +2,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -21,6 +22,7 @@ constexpr int kNumTransports = 3;
 constexpr int kDays = 30;
 constexpr int kGroups = 128;
 constexpr int kRepetitions = 14;
+constexpr int kFixedBreakdownSeeds = 100;
 
 const std::array<std::string, kNumTransports> kTransportNames = {
     "obfs4", "snowflake", "meek"};
@@ -91,6 +93,50 @@ struct AggregateStats {
   int count = 0;
 };
 
+struct SampleStats {
+  double sum = 0.0;
+  double sum_sq = 0.0;
+  int count = 0;
+
+  void Add(const double x) {
+    sum += x;
+    sum_sq += x * x;
+    ++count;
+  }
+
+  double Mean() const {
+    if (count == 0) return 0.0;
+    return sum / static_cast<double>(count);
+  }
+
+  double StdDevSample() const {
+    if (count <= 1) return 0.0;
+    const double mean = Mean();
+    const double centered = sum_sq - static_cast<double>(count) * mean * mean;
+    const double var =
+        std::max(0.0, centered / static_cast<double>(count - 1));
+    return std::sqrt(var);
+  }
+};
+
+struct FixedBreakdownSummaryRow {
+  std::string block_name;
+  std::string column_name;
+  std::string system;
+  std::string adversary;
+  double sybil_fraction = 0.0;
+  double user_arrival = 0.0;
+  double bridge_arrival = 0.0;
+  int seeds = 0;
+  double mean_day30_success = 0.0;
+  double std_day30_success = 0.0;
+};
+
+struct FixedCellSpec {
+  AttackStrategy strategy;
+  double sybil_fraction;
+};
+
 uint64_t TupleKey(const int g, const int t, const int b) {
   return (static_cast<uint64_t>(g) << 40) |
          (static_cast<uint64_t>(t) << 32) |
@@ -122,11 +168,26 @@ std::string StrategyName(const AttackStrategy s) {
   return "unknown";
 }
 
-double Mean(const std::vector<double>& xs) {
-  if (xs.empty()) return 0.0;
-  double sum = 0.0;
-  for (const double x : xs) sum += x;
-  return sum / static_cast<double>(xs.size());
+std::string FormatFixed(const double x, const int precision) {
+  std::ostringstream oss;
+  oss << std::fixed << std::setprecision(precision) << x;
+  return oss.str();
+}
+
+std::string FixedScenarioKey(const AttackStrategy strategy,
+                             const double sybil_fraction,
+                             const double user_arrival,
+                             const double bridge_arrival,
+                             const std::string& system) {
+  return StrategyName(strategy) + "|" + FormatFixed(sybil_fraction, 2) + "|" +
+         FormatFixed(user_arrival, 2) + "|" + FormatFixed(bridge_arrival, 2) +
+         "|" + system;
+}
+
+std::string FixedSummaryKey(const std::string& block_name,
+                            const std::string& column_name,
+                            const std::string& system) {
+  return block_name + "|" + column_name + "|" + system;
 }
 
 int RandInt(std::mt19937_64* rng, const int lo, const int hi) {
@@ -862,6 +923,167 @@ void WriteSybilBreakdownTex(
   f << "\\end{table}\n";
 }
 
+void WriteFixedBreakdownSummaryCsv(
+    const std::filesystem::path& outdir,
+    const std::vector<FixedBreakdownSummaryRow>& rows) {
+  std::ofstream f(outdir / "policy_breakdown_fixed_summary.csv");
+  f << "block,column,system,adversary,sybil_fraction,user_arrival,bridge_arrival,seeds,mean_day30_success_rate,std_day30_success_rate,mean_day30_success_pct,std_day30_success_pct\n";
+  for (const auto& row : rows) {
+    f << row.block_name << "," << row.column_name << "," << row.system << ","
+      << row.adversary << "," << std::fixed << std::setprecision(2)
+      << row.sybil_fraction << "," << row.user_arrival << ","
+      << row.bridge_arrival << "," << row.seeds << "," << std::setprecision(6)
+      << row.mean_day30_success << "," << row.std_day30_success << ","
+      << std::setprecision(3) << (100.0 * row.mean_day30_success) << ","
+      << (100.0 * row.std_day30_success) << "\n";
+  }
+}
+
+void WriteFixedBreakdownSeedCsv(const std::filesystem::path& outdir,
+                                const std::vector<std::string>& rows) {
+  std::ofstream f(outdir / "policy_breakdown_fixed_per_seed.csv");
+  f << "block,column,system,adversary,sybil_fraction,user_arrival,bridge_arrival,seed_index,seed,day30_success_rate,day30_success_pct\n";
+  for (const std::string& row : rows) f << row << "\n";
+}
+
+void WriteFixedBreakdownNotes(
+    const std::filesystem::path& outdir, const double fixed_user_arrival,
+    const double fixed_bridge_arrival,
+    const std::unordered_map<std::string, SampleStats>& legacy_strategy_pooled,
+    const std::unordered_map<std::string, SampleStats>& legacy_sybil_pooled,
+    const std::unordered_map<std::string, SampleStats>& fixed_cells) {
+  std::ofstream f(outdir / "policy_breakdown_fixed_notes.txt");
+  f << "Fixed-scenario configuration\n";
+  f << "- Adversary-type sweep fixes sybil_fraction=0.20, user_arrival="
+    << FormatFixed(fixed_user_arrival, 2)
+    << ", bridge_arrival=" << FormatFixed(fixed_bridge_arrival, 2) << ".\n";
+  f << "- Sybil-fraction sweep fixes adversary=zig_zag, user_arrival="
+    << FormatFixed(fixed_user_arrival, 2)
+    << ", bridge_arrival=" << FormatFixed(fixed_bridge_arrival, 2) << ".\n";
+  f << "- Each cell uses exactly " << kFixedBreakdownSeeds
+    << " seeds, and the reported std is the sample standard deviation over those "
+    << kFixedBreakdownSeeds << " day-30 success values only.\n";
+  f << "\nWhat changed relative to the old aggregated table\n";
+  f << "- Removed pooling across sybil fractions and user-arrival regimes from the adversary-type breakdown.\n";
+  f << "- Removed pooling across adversary strategies and user-arrival regimes from the Sybil-fraction breakdown.\n";
+  f << "- Added sybil_fraction=0.40 to the zig_zag sweep.\n";
+  f << "- Kept day-30 success definition unchanged: day 30 successful requests divided by total requests for that same run.\n";
+  f << "\nDiagnostic on old standard deviations\n";
+  f << "- The previous breakdown code mixed heterogeneous scenarios before aggregation, so any standard deviation taken there would combine seed noise with scenario shifts.\n";
+
+  int inflated_count = 0;
+  int compared = 0;
+  double max_ratio = 0.0;
+  std::string max_ratio_label;
+
+  for (const auto& kv : legacy_strategy_pooled) {
+    const std::string legacy_key = kv.first;
+    const auto it = fixed_cells.find(legacy_key);
+    if (it == fixed_cells.end()) continue;
+    const double pooled_std = 100.0 * kv.second.StdDevSample();
+    const double fixed_std = 100.0 * it->second.StdDevSample();
+    if (pooled_std > fixed_std + 1e-12) ++inflated_count;
+    ++compared;
+    if (fixed_std > 0.0) {
+      const double ratio = pooled_std / fixed_std;
+      if (ratio > max_ratio) {
+        max_ratio = ratio;
+        max_ratio_label = legacy_key;
+      }
+    }
+  }
+  for (const auto& kv : legacy_sybil_pooled) {
+    const std::string legacy_key = kv.first;
+    const auto it = fixed_cells.find(legacy_key);
+    if (it == fixed_cells.end()) continue;
+    const double pooled_std = 100.0 * kv.second.StdDevSample();
+    const double fixed_std = 100.0 * it->second.StdDevSample();
+    if (pooled_std > fixed_std + 1e-12) ++inflated_count;
+    ++compared;
+    if (fixed_std > 0.0) {
+      const double ratio = pooled_std / fixed_std;
+      if (ratio > max_ratio) {
+        max_ratio = ratio;
+        max_ratio_label = legacy_key;
+      }
+    }
+  }
+
+  if (compared > 0) {
+    f << "- In this regeneration, the heterogeneous pooled std exceeded the matching fixed-scenario std in "
+      << inflated_count << " of " << compared << " comparable cells.\n";
+    if (!max_ratio_label.empty()) {
+      f << "- Largest pooled/fixed std ratio: " << max_ratio_label << " = "
+        << FormatFixed(max_ratio, 2) << "x.\n";
+    }
+  } else {
+    f << "- No comparable cells were available for the pooled-vs-fixed diagnostic.\n";
+  }
+}
+
+void WriteFixedBreakdownTex(
+    const std::filesystem::path& outdir,
+    const std::vector<SystemPolicy>& policies,
+    const std::unordered_map<std::string, FixedBreakdownSummaryRow>& summaries) {
+  const std::vector<AttackStrategy> top_columns = {
+      AttackStrategy::LearnBurn, AttackStrategy::ZigZag,
+      AttackStrategy::Conservative, AttackStrategy::BlanketTransport};
+  const std::vector<double> bottom_columns = {0.10, 0.20, 0.30, 0.40};
+
+  auto format_cell = [&](const std::string& block_name,
+                         const std::string& column_name,
+                         const std::string& system) {
+    const auto it = summaries.find(
+        FixedSummaryKey(block_name, column_name, system));
+    if (it == summaries.end()) return std::string("??$\\pm$??");
+    const FixedBreakdownSummaryRow& row = it->second;
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(1)
+        << (100.0 * row.mean_day30_success) << "$\\pm$"
+        << (100.0 * row.std_day30_success);
+    return oss.str();
+  };
+
+  std::ofstream f(outdir / "policy_breakdown_fixed_table.tex");
+  f << "\\begin{table}[t]\n";
+  f << "\\centering\n";
+  f << "\\footnotesize\n";
+  f << "\\setlength{\\tabcolsep}{4pt}\n";
+  f << "\\renewcommand{\\arraystretch}{1.08}\n";
+  f << "\\caption{Day-30 success (\\%, mean $\\pm$ std) from 100 seeds per fixed scenario. In the adversary-type sweep, the Sybil fraction is fixed to $f=0.20$. In the Sybil-fraction sweep, the adversary is fixed to \\texttt{zig\\_zag}. Each cell reports variation across seeds only.}\n";
+  f << "\\label{tab:policy-breakdown-fixed}\n";
+  f << "\\begin{tabular*}{\\columnwidth}{@{\\extracolsep{\\fill}} l c c c c @{}}\n";
+  f << "\\toprule\n";
+  f << "\\multicolumn{5}{c}{\\textbf{Adversary-type sweep (fixed Sybil fraction $f=0.20$)}} \\\\\n";
+  f << "\\midrule\n";
+  f << "System & learn\\_burn & zig\\_zag & conservative & blanket\\_transport \\\\\n";
+  f << "\\midrule\n";
+  for (const auto& policy : policies) {
+    f << policy.label;
+    for (const AttackStrategy strategy : top_columns) {
+      f << " & " << format_cell("adversary_type", StrategyName(strategy),
+                                policy.label);
+    }
+    f << " \\\\\n";
+  }
+  f << "\\midrule\n";
+  f << "\\multicolumn{5}{c}{\\textbf{Sybil-fraction sweep (fixed adversary \\texttt{zig\\_zag})}} \\\\\n";
+  f << "\\midrule\n";
+  f << "System & 0.10 & 0.20 & 0.30 & 0.40 \\\\\n";
+  f << "\\midrule\n";
+  for (const auto& policy : policies) {
+    f << policy.label;
+    for (const double sybil : bottom_columns) {
+      f << " & " << format_cell("sybil_fraction", FormatFixed(sybil, 2),
+                                policy.label);
+    }
+    f << " \\\\\n";
+  }
+  f << "\\bottomrule\n";
+  f << "\\end{tabular*}\n";
+  f << "\\end{table}\n";
+}
+
 void WritePgfplotSnippet(const std::filesystem::path& outdir) {
   std::ofstream f(outdir / "policy_main_figure_pgf.tex");
   f << "% Requires \\usepackage{pgfplots,subcaption}\n";
@@ -979,6 +1201,8 @@ void WriteSectionDraft(const std::filesystem::path& outdir) {
        "reflecting trust/suspicion gating.\n";
   f << "Across the full robustness sweep (Table~\\ref{tab:policy-robustness-overall}), "
        "the same pattern holds: G-Lox gives the strongest end-to-end success under full issuance.\n\n";
+  f << "Table~\\ref{tab:policy-breakdown-fixed} fixes one scenario per cell and reports "
+       "mean $\\pm$ std over 100 seeds, making the per-cell variability directly interpretable.\n\n";
 
   f << "\\paragraph{Takeaway.}\n";
   f << "Under stronger adversaries and source-backed baseline abstractions, G-Lox improves group-level "
@@ -1104,6 +1328,8 @@ int main() {
                      robustness_by_system);
   std::unordered_map<std::string, AggregateStats> by_strategy_system;
   std::unordered_map<std::string, AggregateStats> by_sybil_system;
+  std::unordered_map<std::string, SampleStats> legacy_strategy_pooled;
+  std::unordered_map<std::string, SampleStats> legacy_sybil_pooled;
   for (const std::string& row : robustness_rows) {
     std::stringstream ss(row);
     std::string strategy, sybil, user_arrival, system, issued, success, wasted,
@@ -1142,10 +1368,142 @@ int main() {
       a.migrations_sum += mig_v;
       ++a.count;
     }
+    {
+      const AttackStrategy fixed_strategy =
+          (strategy == "learn_burn")
+              ? AttackStrategy::LearnBurn
+              : (strategy == "zig_zag")
+                    ? AttackStrategy::ZigZag
+                    : (strategy == "conservative")
+                          ? AttackStrategy::Conservative
+                          : AttackStrategy::BlanketTransport;
+      const std::string key = FixedScenarioKey(
+          fixed_strategy, 0.20, main_scenario.user_arrival,
+          main_scenario.bridge_arrival, system);
+      legacy_strategy_pooled[key].Add(success_v);
+    }
+    {
+      const std::string key = FixedScenarioKey(
+          AttackStrategy::ZigZag, std::stod(sybil), main_scenario.user_arrival,
+          main_scenario.bridge_arrival, system);
+      legacy_sybil_pooled[key].Add(success_v);
+    }
   }
   WriteStrategyBreakdownCsv(outdir, strategies, policies, by_strategy_system);
   WriteStrategyBreakdownTex(outdir, strategies, policies, by_strategy_system);
   WriteSybilBreakdownTex(outdir, sybil_rates, policies, by_sybil_system);
+
+  std::vector<FixedCellSpec> fixed_specs = {
+      {AttackStrategy::LearnBurn, 0.20},
+      {AttackStrategy::ZigZag, 0.20},
+      {AttackStrategy::Conservative, 0.20},
+      {AttackStrategy::BlanketTransport, 0.20},
+      {AttackStrategy::ZigZag, 0.10},
+      {AttackStrategy::ZigZag, 0.30},
+      {AttackStrategy::ZigZag, 0.40},
+  };
+  std::unordered_map<std::string, SampleStats> fixed_cells;
+  std::unordered_map<std::string, std::vector<std::pair<uint64_t, double>>>
+      fixed_seed_outcomes;
+
+  for (size_t spec_idx = 0; spec_idx < fixed_specs.size(); ++spec_idx) {
+    const FixedCellSpec& spec = fixed_specs[spec_idx];
+    const Scenario sc = {"fixed_breakdown", spec.strategy, spec.sybil_fraction,
+                         main_scenario.user_arrival, main_scenario.bridge_arrival};
+    for (int rep = 0; rep < kFixedBreakdownSeeds; ++rep) {
+      for (size_t pi = 0; pi < policies.size(); ++pi) {
+        const uint64_t seed =
+            0xF17EDULL + 100000ULL * static_cast<uint64_t>(spec_idx) +
+            1000ULL * static_cast<uint64_t>(rep) + 41ULL * static_cast<uint64_t>(pi);
+        RunResult r = RunSingle(sc, policies[pi], seed, false);
+        const std::string key = FixedScenarioKey(
+            spec.strategy, spec.sybil_fraction, sc.user_arrival,
+            sc.bridge_arrival, policies[pi].label);
+        fixed_cells[key].Add(r.day30_success);
+        fixed_seed_outcomes[key].push_back({seed, r.day30_success});
+      }
+    }
+  }
+
+  std::vector<FixedBreakdownSummaryRow> fixed_summary_rows;
+  std::unordered_map<std::string, FixedBreakdownSummaryRow> fixed_summary_map;
+  std::vector<std::string> fixed_seed_rows;
+
+  auto emit_fixed_block =
+      [&](const std::string& block_name, const std::vector<FixedCellSpec>& specs,
+          const std::vector<std::string>& column_names) {
+        for (size_t col_idx = 0; col_idx < specs.size(); ++col_idx) {
+          const FixedCellSpec& spec = specs[col_idx];
+          for (const auto& policy : policies) {
+            const std::string scenario_key = FixedScenarioKey(
+                spec.strategy, spec.sybil_fraction, main_scenario.user_arrival,
+                main_scenario.bridge_arrival, policy.label);
+            const auto it = fixed_cells.find(scenario_key);
+            if (it == fixed_cells.end() ||
+                it->second.count != kFixedBreakdownSeeds) {
+              std::cerr << "fixed breakdown cell has unexpected sample count: "
+                        << scenario_key << "\n";
+              std::exit(1);
+            }
+
+            const FixedBreakdownSummaryRow row = {
+                block_name,
+                column_names[col_idx],
+                policy.label,
+                StrategyName(spec.strategy),
+                spec.sybil_fraction,
+                main_scenario.user_arrival,
+                main_scenario.bridge_arrival,
+                it->second.count,
+                it->second.Mean(),
+                it->second.StdDevSample(),
+            };
+            fixed_summary_rows.push_back(row);
+            fixed_summary_map[FixedSummaryKey(block_name, column_names[col_idx],
+                                             policy.label)] = row;
+
+            const auto seed_it = fixed_seed_outcomes.find(scenario_key);
+            if (seed_it == fixed_seed_outcomes.end()) continue;
+            for (size_t seed_idx = 0; seed_idx < seed_it->second.size(); ++seed_idx) {
+              const auto& outcome = seed_it->second[seed_idx];
+              std::ostringstream row_stream;
+              row_stream << block_name << "," << column_names[col_idx] << ","
+                         << policy.label << "," << StrategyName(spec.strategy)
+                         << "," << std::fixed << std::setprecision(2)
+                         << spec.sybil_fraction << ","
+                         << main_scenario.user_arrival << ","
+                         << main_scenario.bridge_arrival << ","
+                         << (seed_idx + 1) << "," << outcome.first << ","
+                         << std::setprecision(6) << outcome.second << ","
+                         << std::setprecision(3) << (100.0 * outcome.second);
+              fixed_seed_rows.push_back(row_stream.str());
+            }
+          }
+        }
+      };
+
+  emit_fixed_block(
+      "adversary_type",
+      {{AttackStrategy::LearnBurn, 0.20},
+       {AttackStrategy::ZigZag, 0.20},
+       {AttackStrategy::Conservative, 0.20},
+       {AttackStrategy::BlanketTransport, 0.20}},
+      {"learn_burn", "zig_zag", "conservative", "blanket_transport"});
+  emit_fixed_block(
+      "sybil_fraction",
+      {{AttackStrategy::ZigZag, 0.10},
+       {AttackStrategy::ZigZag, 0.20},
+       {AttackStrategy::ZigZag, 0.30},
+       {AttackStrategy::ZigZag, 0.40}},
+      {"0.10", "0.20", "0.30", "0.40"});
+
+  WriteFixedBreakdownSummaryCsv(outdir, fixed_summary_rows);
+  WriteFixedBreakdownSeedCsv(outdir, fixed_seed_rows);
+  WriteFixedBreakdownTex(outdir, policies, fixed_summary_map);
+  WriteFixedBreakdownNotes(outdir, main_scenario.user_arrival,
+                           main_scenario.bridge_arrival,
+                           legacy_strategy_pooled, legacy_sybil_pooled,
+                           fixed_cells);
   WritePgfplotSnippet(outdir);
   WriteSectionDraft(outdir);
 
